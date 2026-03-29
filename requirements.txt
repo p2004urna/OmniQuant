@@ -1,0 +1,12 @@
+yfinance
+pandas<3.0.0
+numpy<2.0.0
+ta
+scikit-learn
+xgboost
+statsmodels
+streamlit
+plotly
+nltk
+beautifulsoup4
+requests
