@@ -13,7 +13,6 @@ import urllib.request
 urllib.request.getproxies = lambda: {}   # macOS proxy-hang fix
 
 import pytz
-import requests
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -123,39 +122,28 @@ def get_bulletproof_data(
     ticker: str, days_back: int, display_currency: str
 ) -> tuple[pd.DataFrame, str, list[str]]:
     """
-    Bulletproof data engine that fixes two cloud-deployment bugs:
+    Bulletproof data engine — fixes the IST Timezone Desync bug.
 
-    1. Cloud IP Blockade — Yahoo Finance rate-limits headless cloud IPs.
-       We disguise our request as a modern Chrome browser via a custom
-       requests.Session with a spoofed User-Agent header.
+    Cloud servers run on UTC. Computing 'today' without a timezone causes
+    start/end dates to drift by up to ±5:30 h vs. IST, potentially producing
+    zero-length date windows. We anchor every calculation to 'Asia/Kolkata'.
 
-    2. IST Timezone Desync — Cloud servers often run on UTC.  Computing
-       'today' without a timezone causes the start/end dates to drift by
-       up to ±5:30 h vs. IST, potentially requesting zero-length windows.
-       We anchor every date calculation to 'Asia/Kolkata'.
+    NOTE: Session management is intentionally omitted. yfinance ≥0.2.38 uses
+    its own curl_cffi stealth transport internally and explicitly rejects any
+    externally-supplied requests.Session — passing one raises an error.
+    yfinance handles the stealth connection natively with threads=False.
 
-    Result is cached for 1 hour (ttl=3600 s) so subsequent UI interactions
-    reuse the pre-fetched DataFrame instantly.
+    Result is cached for 1 hour (ttl=3600 s).
     """
     # ── IST-aware date window ─────────────────────────────────────────────────
-    ist = pytz.timezone("Asia/Kolkata")
-    end_date   = datetime.now(ist)
-    start_date = end_date - timedelta(days=days_back)
-    end_str   = end_date.strftime("%Y-%m-%d")
-    start_str = start_date.strftime("%Y-%m-%d")
-
-    # ── Anti-blockade session ─────────────────────────────────────────────────
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
-    })
+    ist        = pytz.timezone("Asia/Kolkata")
+    now_india  = datetime.now(ist)
+    start_india = now_india - timedelta(days=days_back)
+    end_str    = now_india.strftime("%Y-%m-%d")
+    start_str  = start_india.strftime("%Y-%m-%d")
 
     orch = DataOrchestrator()
-    return orch.process(ticker, start_str, end_str, display_currency, session=session)
+    return orch.process(ticker, start_str, end_str, display_currency)
 
 st.set_page_config(
     page_title="OmniQuant · AutoML Forecaster",
