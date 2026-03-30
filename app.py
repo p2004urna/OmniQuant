@@ -12,6 +12,10 @@ Streamlit application that:
 import urllib.request
 urllib.request.getproxies = lambda: {}   # macOS proxy-hang fix
 
+import pytz
+import requests
+from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -115,14 +119,43 @@ def generate_future_forecast(
 
 
 @st.cache_data(ttl=3600)
-def load_data(ticker: str, start_str: str, end_str: str, display_currency: str) -> tuple[pd.DataFrame, str, list[str]]:
+def get_bulletproof_data(
+    ticker: str, days_back: int, display_currency: str
+) -> tuple[pd.DataFrame, str, list[str]]:
     """
-    Cached data pipeline — downloads OHLCV data and engineers all TA features.
-    Result is stored in Streamlit's memory cache for 1 hour (ttl=3600 s).
-    Subsequent UI interactions reuse the cached DataFrame instantly.
+    Bulletproof data engine that fixes two cloud-deployment bugs:
+
+    1. Cloud IP Blockade — Yahoo Finance rate-limits headless cloud IPs.
+       We disguise our request as a modern Chrome browser via a custom
+       requests.Session with a spoofed User-Agent header.
+
+    2. IST Timezone Desync — Cloud servers often run on UTC.  Computing
+       'today' without a timezone causes the start/end dates to drift by
+       up to ±5:30 h vs. IST, potentially requesting zero-length windows.
+       We anchor every date calculation to 'Asia/Kolkata'.
+
+    Result is cached for 1 hour (ttl=3600 s) so subsequent UI interactions
+    reuse the pre-fetched DataFrame instantly.
     """
+    # ── IST-aware date window ─────────────────────────────────────────────────
+    ist = pytz.timezone("Asia/Kolkata")
+    end_date   = datetime.now(ist)
+    start_date = end_date - timedelta(days=days_back)
+    end_str   = end_date.strftime("%Y-%m-%d")
+    start_str = start_date.strftime("%Y-%m-%d")
+
+    # ── Anti-blockade session ─────────────────────────────────────────────────
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    })
+
     orch = DataOrchestrator()
-    return orch.process(ticker, start_str, end_str, display_currency)
+    return orch.process(ticker, start_str, end_str, display_currency, session=session)
 
 st.set_page_config(
     page_title="OmniQuant · AutoML Forecaster",
@@ -250,22 +283,28 @@ if not run_btn and "results" not in st.session_state:
 
 # ── Pipeline (only runs when the button is clicked) ───────────────────────────
 if run_btn:
-    from datetime import datetime, timedelta
-    end_dt   = datetime.now()
-    start_dt = end_dt - timedelta(days=lookback)
-    end_str  = end_dt.strftime("%Y-%m-%d")
-    start_str = start_dt.strftime("%Y-%m-%d")
-
-    # 1. Data Orchestration
-    with st.spinner(f"⬇️  Fetching {ticker} data ({start_str} → {end_str})…"):
+    # 1. Data Orchestration — bulletproof engine (IST dates + anti-blockade session)
+    with st.spinner(f"⬇️  Fetching {ticker} data via Bulletproof Engine …"):
         try:
-            df, currency_code, latest_headlines = load_data(ticker, start_str, end_str, display_currency)
+            df, currency_code, latest_headlines = get_bulletproof_data(
+                ticker, lookback, display_currency
+            )
         except Exception as exc:
             st.error(f"❌ Data fetch failed for **{ticker}**: {exc}")
             st.stop()
 
-    if df.empty or len(df) < 60:
-        st.error(f"❌ Not enough data for **{ticker}**. Try a different ticker or extend the lookback period.")
+    if df is None or df.empty:
+        st.warning(
+            f"⚠️ Data fetch failed for **{ticker}**. "
+            "Please check the symbol or try again later."
+        )
+        st.stop()
+
+    if len(df) < 60:
+        st.warning(
+            f"⚠️ Not enough trading data for **{ticker}** "
+            "(fewer than 60 rows). Try extending the lookback period."
+        )
         st.stop()
 
     # 2. Feature / Target split
