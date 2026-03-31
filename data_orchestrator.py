@@ -1,77 +1,63 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import ta
+import pandas_ta as ta
 import nltk
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-try:
-    nltk.download('vader_lexicon', quiet=True)
-except Exception:
-    pass
-
-def get_news_sentiment(ticker: str) -> tuple[pd.DataFrame, list[str]]:
+def get_news_sentiment(ticker_symbol: str) -> float:
     try:
-        news_data = yf.Ticker(ticker).news
-        
+        news_data = yf.Ticker(ticker_symbol).news
         if not news_data:
-            return pd.DataFrame(columns=['Sentiment']), []
-        
-        vader = SentimentIntensityAnalyzer()
-        parsed_data = []
-        top_headlines = []
-        
+            return 0.0
+            
+        analyzer = SentimentIntensityAnalyzer()
+        scores = []
         for item in news_data:
             content = item.get('content', {})
-            title   = content.get('title', '') if isinstance(content, dict) else item.get('title', '')
-            if not title:
-                continue
+            title = content.get('title', '') if isinstance(content, dict) else item.get('title', '')
+            if title:
+                scores.append(analyzer.polarity_scores(title)['compound'])
+                
+        if not scores:
+            return 0.0
             
-            top_headlines.append(title)
-            
-            pub_date = content.get('pubDate', '') if isinstance(content, dict) else item.get('providerPublishTime', '')
-            try:
-                date = pd.to_datetime(pub_date, unit='s' if isinstance(pub_date, (int, float)) else None).normalize()
-            except Exception:
-                date = pd.Timestamp.today().normalize()
-            
-            score = vader.polarity_scores(title)['compound']
-            parsed_data.append({'Date': date, 'Sentiment': score})
-        
-        if not parsed_data:
-            return pd.DataFrame(columns=['Sentiment']), []
-        
-        df = pd.DataFrame(parsed_data)
-        df['Date'] = pd.to_datetime(df['Date'])
-        daily_sentiment = df.groupby('Date')['Sentiment'].mean()
-        daily_sentiment.index = pd.to_datetime(daily_sentiment.index)
-        
-        return daily_sentiment.to_frame(), top_headlines[:5]
-        
+        return float(np.mean(scores))
     except Exception as e:
-        print(f"Error fetching sentiment for {ticker}: {e}")
-        
-    return pd.DataFrame(columns=['Sentiment']), []
+        print(f"Error fetching sentiment for {ticker_symbol}: {e}")
+        return 0.0
 
 class DataOrchestrator:
     def __init__(self):
         """Initialize the DataOrchestrator."""
         pass
 
-    def fetch_data(self, ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch_data(
+        self,
+        ticker: str,
+        start_date: str,
+        end_date: str,
+    ) -> pd.DataFrame:
         """
         Fetch historical OHLCV data from Yahoo Finance.
-        
+
         Args:
-            ticker: Stock ticker symbol (e.g., 'AAPL')
+            ticker:     Stock ticker symbol (e.g., 'AAPL')
             start_date: Start date in 'YYYY-MM-DD' format
-            end_date: End date in 'YYYY-MM-DD' format
-            
+            end_date:   End date in 'YYYY-MM-DD' format
+
         Returns:
             pd.DataFrame: DataFrame containing historical OHLCV data
         """
         print(f"Fetching data for {ticker} from {start_date} to {end_date}...")
-        df = yf.download(ticker, start=start_date, end=end_date, auto_adjust=True)
+        df = yf.download(
+            ticker,
+            start=start_date,
+            end=end_date,
+            auto_adjust=True,
+            threads=False,    # avoid thread-pool hangs on cloud servers
+            progress=False,   # suppress progress bar output
+        )
         if df.empty:
             raise ValueError(f"No data found for {ticker} in the given date range.")
         return df
@@ -99,31 +85,15 @@ class DataOrchestrator:
         if "Close" not in df.columns:
             raise ValueError("The dataframe does not contain a 'Close' column.")
 
+        # Append technical indicators using pandas_ta strategy
+        df.ta.bbands(length=20, std=2, append=True)
+        df.ta.atr(length=14, append=True)
+        df.ta.rsi(length=14, append=True)
+        df.ta.macd(fast=12, slow=26, signal=9, append=True)
+        df.ta.obv(append=True)
+
+        # Log Returns
         close  = df["Close"]
-        high   = df["High"]
-        low    = df["Low"]
-
-        # 1. SMA (20-period)
-        df["SMA_20"] = ta.trend.sma_indicator(close, window=20)
-
-        # 2. RSI (14-period)
-        df["RSI_14"] = ta.momentum.rsi(close, window=14)
-
-        # 3. MACD
-        macd_obj = ta.trend.MACD(close)
-        df["MACD_12_26_9"]  = macd_obj.macd()
-        df["MACDh_12_26_9"] = macd_obj.macd_diff()
-        df["MACDs_12_26_9"] = macd_obj.macd_signal()
-
-        # 4. Bollinger Bands
-        bb = ta.volatility.BollingerBands(close, window=20, window_dev=2)
-        df["BBL_20_2"] = bb.bollinger_lband()
-        df["BBM_20_2"] = bb.bollinger_mavg()
-        df["BBU_20_2"] = bb.bollinger_hband()
-        df["BBB_20_2"] = bb.bollinger_wband()
-        df["BBP_20_2"] = bb.bollinger_pband()
-
-        # 5. Log Returns
         df["Log_Returns"] = np.log(close / close.shift(1))
 
         # Drop NaN rows from rolling-window warm-up
@@ -132,7 +102,13 @@ class DataOrchestrator:
 
         return df
 
-    def process(self, ticker: str, start_date: str, end_date: str, display_currency: str = 'Native') -> tuple[pd.DataFrame, str, list[str]]:
+    def process(
+        self,
+        ticker: str,
+        start_date: str,
+        end_date: str,
+        display_currency: str = 'Native',
+    ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, str, list]:
         """
         Execute the full data ingestion and feature engineering pipeline.
         """
@@ -143,19 +119,21 @@ class DataOrchestrator:
             df.columns = df.columns.get_level_values(0)
         df.columns = [str(c).strip().title() for c in df.columns]
         
-        # Merge sentiment
         print("Fetching news sentiment via Yahoo Finance...")
-        sentiment_df, top_headlines = get_news_sentiment(ticker)
+        live_sentiment = get_news_sentiment(ticker)
         
         # Strip timezones from both indices to prevent tz-naive / tz-aware clash
         df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
         
-        if not sentiment_df.empty:
-            sentiment_df.index = sentiment_df.index.tz_localize(None) if sentiment_df.index.tz is not None else sentiment_df.index
-            df = df.join(sentiment_df, how='left')
-            df['Sentiment'] = df['Sentiment'].fillna(0.0)
-        else:
-            df['Sentiment'] = 0.0
+        top_headlines = []
+        try:
+            news_data = yf.Ticker(ticker).news
+            for item in news_data[:5]:
+                content = item.get('content', {})
+                t = content.get('title', '') if isinstance(content, dict) else item.get('title', '')
+                if t: top_headlines.append(t)
+        except Exception:
+            pass
 
         base_currency = yf.Ticker(ticker).info.get('currency', 'USD')
         if base_currency is None:
@@ -184,4 +162,24 @@ class DataOrchestrator:
 
         # The add_features method also contains flatten column logic, which is fine to run twice
         df_featured = self.add_features(df)
-        return df_featured, currency_code, top_headlines
+        
+        # Target Shift: strictly shift the Close price backward by one day
+        df_featured['Target_Next_Close'] = df_featured['Close'].shift(-1)
+        
+        # Vectorized Assignment: initialize historical rows to 0.0 to prevent look-ahead bias
+        df_featured['Sentiment_Score'] = 0.0
+        
+        # The inference row assignment
+        df_featured.iloc[-1, df_featured.columns.get_loc('Sentiment_Score')] = live_sentiment
+        
+        # The Inference Row: extract the single row for today's data where Target_Next_Close is NaN
+        X_inference = df_featured.iloc[[-1]].copy()
+        
+        # Drop NaNs for Training: remove rows with missing targets or missing rolling features
+        df_featured.dropna(inplace=True)
+        
+        y_train = df_featured['Target_Next_Close']
+        X_train = df_featured.drop(columns=['Target_Next_Close'])
+        X_inference = X_inference.drop(columns=['Target_Next_Close'])
+        
+        return X_train, y_train, X_inference, currency_code, top_headlines

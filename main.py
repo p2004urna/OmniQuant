@@ -29,9 +29,14 @@ df = orchestrator.process(ticker, start_date_str, end_date_str)
 print(f"\nLayer 1 OK — DataFrame shape: {df.shape}")
 
 # ── Feature / Target split ────────────────────────────────────────────────────
-OHLCV_COLS   = ["Open", "High", "Low", "Close", "Volume"]
 TARGET_COL   = "Close"
-feature_cols = [c for c in df.columns if c not in OHLCV_COLS]
+
+# Dynamically include pandas_ta columns (matching specific prefixes) and exclude the target variable
+ta_patterns = ("RSI_", "BBL_", "BBM_", "BBU_", "BBB_", "BBP_", "MACD", "ATR", "OBV", "SMA_")
+feature_cols = [
+    c for c in df.columns 
+    if c != TARGET_COL and (c.startswith(ta_patterns) or c in ["Log_Returns", "Sentiment", "Volume"])
+]
 
 X = df[feature_cols]
 y = df[TARGET_COL]

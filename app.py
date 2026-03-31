@@ -14,37 +14,38 @@ urllib.request.getproxies = lambda: {}   # macOS proxy-hang fix
 
 import pytz
 from datetime import datetime, timedelta
+import gc
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import ta
+import pandas_ta as ta
 
 from data_orchestrator import DataOrchestrator
 from evaluator import run_backtest
-from model_zoo import TreeForecaster, ForestForecaster, StatisticalForecaster
+from model_zoo import TreeForecaster, ForestForecaster, StatisticalForecaster, TimeExpert
+from model_trainer import MetaForecaster
 
 # ── Future Forecasting Helper ─────────────────────────────────────────────────
 
 def _recompute_features(close_s: pd.Series, feature_cols: list) -> pd.DataFrame:
     """Recalculate all TA features from a Close price series."""
     tmp = pd.DataFrame({"Close": close_s})
-    tmp["SMA_20"]       = ta.trend.sma_indicator(tmp["Close"], window=20)
-    tmp["RSI_14"]       = ta.momentum.rsi(tmp["Close"], window=14)
-    macd = ta.trend.MACD(tmp["Close"])
-    tmp["MACD_12_26_9"]  = macd.macd()
-    tmp["MACDh_12_26_9"] = macd.macd_diff()
-    tmp["MACDs_12_26_9"] = macd.macd_signal()
-    bb = ta.volatility.BollingerBands(tmp["Close"], window=20, window_dev=2)
-    tmp["BBL_20_2"] = bb.bollinger_lband()
-    tmp["BBM_20_2"] = bb.bollinger_mavg()
-    tmp["BBU_20_2"] = bb.bollinger_hband()
-    tmp["BBB_20_2"] = bb.bollinger_wband()
-    tmp["BBP_20_2"] = bb.bollinger_pband()
+    
+    tmp["Open"] = tmp["Close"]
+    tmp["High"] = tmp["Close"]
+    tmp["Low"] = tmp["Close"]
+    tmp["Volume"] = 1000000 
+    
+    tmp.ta.bbands(length=20, std=2, append=True)
+    tmp.ta.atr(length=14, append=True)
+    tmp.ta.rsi(length=14, append=True)
+    tmp.ta.macd(fast=12, slow=26, signal=9, append=True)
+    tmp.ta.obv(append=True)
+    
     tmp["Log_Returns"] = np.log(tmp["Close"] / tmp["Close"].shift(1))
     
-    # Handle external features like NLP Sentiment by filling with neutral value
     for col in feature_cols:
         if col not in tmp.columns:
             tmp[col] = 0.0
@@ -55,87 +56,75 @@ def _recompute_features(close_s: pd.Series, feature_cols: list) -> pd.DataFrame:
 def generate_future_forecast(
     model,
     model_name: str,
-    df: pd.DataFrame,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_inference: pd.DataFrame,
     feature_cols: list,
     target_col: str = "Close",
     n_days: int = 7,
 ) -> pd.DataFrame:
-    """
-    Retrain the winning model on 100 % of available data, then generate
-    an n_days out-of-sample forecast using a recursive strategy:
-
-      For each future step t:
-        1. Compute feature vector from the extended Close price history
-        2. Ask the model to predict the next Close
-        3. Append the predicted Close to the history and repeat
-
-    StatisticalForecaster (ARIMA) natively supports multi-step forecast,
-    so it takes the direct path without the recursive loop.
-
-    Returns a DataFrame indexed by future business dates with columns
-    ['Predicted_Close'].
-    """
     from pandas.tseries.offsets import BDay
+    from model_zoo import TimeExpert
+    from model_trainer import MetaForecaster
 
-    X_full = df[feature_cols]
-    y_full = df[target_col]
+    X_full = X_train[feature_cols]
+    y_full = y_train
 
-    # ── Retrain on 100 % of data ──────────────────────────────────────────────
-    model.train(X_full, y_full)
+    # Wait, the model is already trained from evaluator.py's backtest.
+    # But just to be sure we can train it again or it's implicitly trained.
+    # Let's use the passed model as is, it's already trained on 100%.
 
-    last_date    = df.index[-1]
-    future_dates = pd.bdate_range(start=last_date + BDay(1), periods=n_days)
+    last_date = X_train.index[-1] + BDay(1)
+    if not X_inference.empty and X_inference.index[0] > X_train.index[-1]:
+        last_date = X_inference.index[0]
+        
+    future_dates = pd.bdate_range(start=last_date, periods=n_days)
 
-    if isinstance(model, StatisticalForecaster):
-        # ── Direct path for ARIMA ─────────────────────────────────────────────
-        preds = model.predict(pd.DataFrame(index=future_dates))
-        return pd.DataFrame({"Predicted_Close": preds.round(4)}, index=future_dates)
-
-    # ── Recursive loop for Tree forecasters ────────────────────────────
-    # Seed the rolling history with the real Close prices
-    close_history = df[target_col].tolist()
-    future_preds  = []
-
-    for _ in range(n_days):
-        # Rebuild the full Close series (real + already-predicted days)
+    xgb_future_preds = []
+    
+    # Day 1 prediction from X_inference
+    curr_inf_row = X_inference[feature_cols].copy()
+    xgb_pred_day1 = float(model.predict(curr_inf_row)[0])
+    xgb_future_preds.append(round(xgb_pred_day1, 4))
+    
+    # Simulated Future History for days 2 to n_days
+    close_history = X_train[target_col].tolist()
+    close_history.append(xgb_pred_day1)
+    
+    for _ in range(1, n_days):
         close_series = pd.Series(close_history, dtype=float)
-
-        # Recompute all TA indicators on the extended series
         feature_df = _recompute_features(close_series, feature_cols)
-
-        # Use the very last (most recent) clean feature row
-        last_row = feature_df.dropna().iloc[[-1]]  # shape (1, n_features)
-
-        # Predict the next closing price
+        last_row = feature_df.dropna().iloc[[-1]] 
         pred_close = float(model.predict(last_row)[0])
-        future_preds.append(round(pred_close, 4))
-
-        # Extend history so the next iteration's indicators include this step
+        xgb_future_preds.append(round(pred_close, 4))
         close_history.append(pred_close)
 
-    return pd.DataFrame({"Predicted_Close": future_preds}, index=future_dates)
+    # Prophet predictions
+    time_model = TimeExpert()
+    prophet_preds = time_model.forecast(X_train, horizon=n_days)
+
+    # Ensemble!
+    meta = MetaForecaster()
+    weights_used = meta._get_volatility_weights(X_train)
+    
+    valid_keys = ['xgboost', 'prophet']
+    final_weights = meta._redistribute_weights(weights_used, valid_keys)
+    w_xgb = final_weights['xgboost']
+    w_pro = final_weights['prophet']
+    
+    ensemble_preds = []
+    for i in range(n_days):
+        ensemble_price = xgb_future_preds[i] * w_xgb + prophet_preds[i] * w_pro
+        ensemble_preds.append(round(float(ensemble_price), 4))
+
+    return pd.DataFrame({"Predicted_Close": ensemble_preds}, index=future_dates[:n_days])
 
 
 
 @st.cache_data(ttl=3600)
 def get_bulletproof_data(
     ticker: str, days_back: int, display_currency: str
-) -> tuple[pd.DataFrame, str, list[str]]:
-    """
-    Bulletproof data engine — fixes the IST Timezone Desync bug.
-
-    Cloud servers run on UTC. Computing 'today' without a timezone causes
-    start/end dates to drift by up to ±5:30 h vs. IST, potentially producing
-    zero-length date windows. We anchor every calculation to 'Asia/Kolkata'.
-
-    NOTE: Session management is intentionally omitted. yfinance ≥0.2.38 uses
-    its own curl_cffi stealth transport internally and explicitly rejects any
-    externally-supplied requests.Session — passing one raises an error.
-    yfinance handles the stealth connection natively with threads=False.
-
-    Result is cached for 1 hour (ttl=3600 s).
-    """
-    # ── IST-aware date window ─────────────────────────────────────────────────
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, str, list]:
     ist        = pytz.timezone("Asia/Kolkata")
     now_india  = datetime.now(ist)
     start_india = now_india - timedelta(days=days_back)
@@ -242,6 +231,10 @@ with st.sidebar:
     st.markdown("🌳 ForestForecaster *(RandomForest)*")
     st.markdown("📈 StatisticalForecaster *(ARIMA)*")
     st.markdown("---")
+    st.markdown("**The AI Council (Ensemble)**")
+    st.markdown("🌲 TreeExpert *(XGBoost)*")
+    st.markdown("⏱️ TimeExpert *(Prophet)*")
+    st.markdown("---")
 
     display_currency = st.selectbox(
         "Display Currency",
@@ -253,7 +246,7 @@ with st.sidebar:
                                value=7, step=1)
     run_btn = st.button("🚀  Run Pipeline", use_container_width=True)
     st.markdown("---")
-    st.caption("OmniQuant v0.5 · Layer 4 + Future Forecast")
+    st.caption("OmniQuant v0.8 · Ensembles + AutoML")
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("# 📈 OmniQuant ")
@@ -265,18 +258,21 @@ if not run_btn and "results" not in st.session_state:
     col1, col2, col3, col4 = st.columns(4)
     col1.info("**Step 1 · Input**\n\nEnter a ticker in the sidebar and choose a lookback period.")
     col2.info("**Step 2 · AutoML Race**\n\nRuns XGBoost, RandomForest, and ARIMA models simultaneously.")
-    col3.info("**Step 3 · Backtest**\n\nEvaluates models over 30 days; the one with lowest RMSE is crowned winner.")
+    col3.info("**Step 3 · Backtest & Meta-Ensemble**\n\nEvaluates RMSE for the race and generates Volatility-Weighted Ensembles.")
     col4.info("**Step 4 · Future**\n\nThe winner is retrained on 100 % data to forecast the next N business days.")
     st.stop()
 
 # ── Pipeline (only runs when the button is clicked) ───────────────────────────
 if run_btn:
-    # 1. Data Orchestration — bulletproof engine (IST dates + anti-blockade session)
+    gc.collect()
+    # 1. Data Orchestration
     with st.spinner(f"⬇️  Fetching {ticker} data via Bulletproof Engine …"):
         try:
-            df, currency_code, latest_headlines = get_bulletproof_data(
+            X_train, y_train, X_inference, currency_code, latest_headlines = get_bulletproof_data(
                 ticker, lookback, display_currency
             )
+            df = X_train # Chronological data for charting
+            current_sentiment = float(X_inference.get('Sentiment_Score', pd.Series([0.0])).iloc[-1])
         except Exception as exc:
             st.error(f"❌ Data fetch failed for **{ticker}**: {exc}")
             st.stop()
@@ -296,26 +292,37 @@ if run_btn:
         st.stop()
 
     # 2. Feature / Target split
-    OHLCV_COLS   = ["Open", "High", "Low", "Close", "Volume"]
     TARGET_COL   = "Close"
-    feature_cols = [c for c in df.columns if c not in OHLCV_COLS]
-    X = df[feature_cols]
-    y = df[TARGET_COL]
+    
+    ta_patterns = ("RSI_", "BBL_", "BBM_", "BBU_", "BBB_", "BBP_", "MACD", "ATR", "OBV", "SMA_")
+    feature_cols = [
+        c for c in X_train.columns 
+        if c != TARGET_COL and c != "Target_Next_Close" and (c.startswith(ta_patterns) or c in ["Log_Returns", "Sentiment_Score", "Volume"])
+    ]
+    
+    X = X_train[feature_cols]
+    y = y_train
 
     # 3. AutoML Race
     zoo = {
         "TreeForecaster (XGBoost)":        TreeForecaster(),
-        "ForestForecaster (RandomForest)":  ForestForecaster(),
-        "StatisticalForecaster (ARIMA)":    StatisticalForecaster(),
+        # "ForestForecaster (RandomForest)":  ForestForecaster(),
+        # "StatisticalForecaster (ARIMA)":    StatisticalForecaster(),
     }
     results = {}
     status_ph = st.empty()
     for name, model_inst in zoo.items():
         status_ph.info(f"⚙️  AutoML Race: Training **{name}**…")
         try:
-            results[name] = run_backtest(model_inst, X, y)
+            if isinstance(model_inst, TreeForecaster):
+                with st.spinner('AI is tuning hyperparameters (20 trials)...'):
+                    results[name] = run_backtest(model_inst, X, y)
+            else:
+                results[name] = run_backtest(model_inst, X, y)
         except Exception as exc:
             st.warning(f"⚠️ {name} failed: {exc}")
+        finally:
+            gc.collect()
 
     if not results:
         st.error("❌ All models in the zoo failed. See logs for details.")
@@ -324,26 +331,62 @@ if run_btn:
 
     winner_name = min(results, key=lambda k: results[k]["rmse"])
     winner_res  = results[winner_name]
-    model       = zoo[winner_name]
+    model       = winner_res.get("model", zoo[winner_name])
 
-    # 4. Future Forecast
-    with st.spinner(f"⏳  Running {n_future_days}-day forecast…"):
+    # 4. Future Forecast (Using fully fitted final model)
+    status_msg = f"⏳  Running {n_future_days}-day ensemble forecast…"
+         
+    with st.spinner(status_msg):
         try:
-            if isinstance(model, TreeForecaster):
-                model_clone = TreeForecaster()
-            elif isinstance(model, ForestForecaster):
-                model_clone = ForestForecaster()
-            else:
-                model_clone = StatisticalForecaster()
             future_df = generate_future_forecast(
-                model=model_clone, model_name=winner_name,
-                df=df, feature_cols=feature_cols,
-                target_col=TARGET_COL, n_days=n_future_days,
+                model=model, model_name=winner_name,
+                X_train=X_train, y_train=y_train, X_inference=X_inference,
+                feature_cols=feature_cols, target_col=TARGET_COL, n_days=n_future_days,
             )
             forecast_ok = True
         except Exception as exc:
             st.error(f"❌ Future forecast failed: {exc}")
             forecast_ok = False
+
+    # 5. AI Council Initialization & Meta-Ensemble Match
+    with st.spinner("🤖 Consulting AI Council (Ensemble Generation)..."):
+        council_preds = {}
+        
+        # 1. Tree (XGBoost)
+        try:
+            tree_model = TreeForecaster()
+            tree_model.train(X, y)
+            council_preds['xgboost'] = float(tree_model.predict(X_inference[feature_cols])[0])
+        except Exception as e:
+            st.warning(f"TreeExpert Failed: {e}")
+            council_preds['xgboost'] = None
+        finally:
+            gc.collect()
+            
+        # 2. Time (Prophet)
+        try:
+            time_model = TimeExpert()
+            prophet_preds = time_model.forecast(X_train, horizon=1)
+            council_preds['prophet'] = float(prophet_preds[-1])
+        except Exception as e:
+            st.warning(f"TimeExpert Failed: {e}")
+            council_preds['prophet'] = None
+        finally:
+            gc.collect()
+            
+        # Meta-Ensemble Execution
+        try:
+            meta = MetaForecaster()
+            ensemble_price = meta.ensemble(df, council_preds)
+            weights_used = meta._get_volatility_weights(df)
+            is_high_vol = (weights_used == meta.weights_high_vol)
+            market_regime = "High Volatility (Stress)" if is_high_vol else "Low Volatility (Calm)"
+        except Exception as e:
+            st.error(f"❌ MetaForecaster Failed: {e}")
+            ensemble_price = None
+            market_regime = "Unknown"
+            weights_used = {}
+            meta = MetaForecaster()
 
     # ── Persist everything to session_state ───────────────────────────────────
     st.session_state["df"]               = df
@@ -356,9 +399,18 @@ if run_btn:
     st.session_state["model"]            = model
     st.session_state["future_df"]        = future_df if forecast_ok else None
     st.session_state["ticker_ran"]       = ticker
+    st.session_state["current_sentiment"] = current_sentiment
     st.session_state["n_future_days"]    = n_future_days
+    
+    # Store Council Details
+    st.session_state["council_preds"]    = council_preds
+    st.session_state["ensemble_price"]   = ensemble_price
+    st.session_state["market_regime"]    = market_regime
+    st.session_state["weights_used"]     = weights_used
+    st.session_state["meta"]             = meta
 
     st.toast(f"Pipeline complete! {winner_name} won the race.", icon="🚀")
+    gc.collect()
 
 # ── UI (renders from session_state — survives widget interactions) ─────────────
 if "results" not in st.session_state:
@@ -376,6 +428,13 @@ model            = st.session_state["model"]
 future_df        = st.session_state["future_df"]
 ticker_ran       = st.session_state["ticker_ran"]
 n_future_days    = st.session_state["n_future_days"]
+current_sentiment = st.session_state.get("current_sentiment", 0.0)
+
+council_preds    = st.session_state.get("council_preds", {})
+ensemble_price   = st.session_state.get("ensemble_price", None)
+market_regime    = st.session_state.get("market_regime", "Unknown")
+weights_used     = st.session_state.get("weights_used", {})
+meta_model       = st.session_state.get("meta", None)
 
 OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
 TARGET_COL = "Close"
@@ -398,21 +457,32 @@ st.markdown(
 )
 
 # ── Metrics Row ───────────────────────────────────────────────────────────────
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Ticker",       ticker_ran)
 m2.metric("Best Engine",  winner_name.split(" (")[0])
 m3.metric("Winner RMSE",  f"{winner_res['rmse']:.4f}")
 m4.metric("Winner MAPE",  f"{winner_res['mape']:.4f} %")
 
-# Sentiment
-latest_sentiment = df["Sentiment"].iloc[-1] if "Sentiment" in df.columns else 0.0
-if latest_sentiment > 0.05:
-    s_label = "Bullish 🟢"
-elif latest_sentiment < -0.05:
-    s_label = "Bearish 🔴"
+if ensemble_price is not None and not np.isnan(ensemble_price):
+    pred_diff = ensemble_price - df["Close"].iloc[-1]
+    pred_pct = (pred_diff / df["Close"].iloc[-1]) * 100
+    m5.metric("Ensemble AI Target", f"{curr_sym}{ensemble_price:.2f}", f"{pred_diff:+.2f} ({pred_pct:+.2f}%)")
 else:
-    s_label = "Neutral ⚪"
-st.info(f"**📰 Current News Sentiment:** {s_label} (Score: {latest_sentiment:.2f})")
+    m5.metric("Ensemble AI Target", "N/A")
+
+# Sentiment
+if current_sentiment > 0.05:
+    st.info(f"📰 **Current News Sentiment:** Bullish 🟢 (Score: {current_sentiment:.2f}) | **Market Regime:** {market_regime}")
+elif current_sentiment < -0.05:
+    st.warning(f"📰 **Current News Sentiment:** Bearish 🔴 (Score: {current_sentiment:.2f}) | **Market Regime:** {market_regime}")
+else:
+    st.markdown(f"📰 **Current News Sentiment:** Neutral ⚪ (Score: {current_sentiment:.2f}) | **Market Regime:** {market_regime}")
+
+if isinstance(model, TreeForecaster) and hasattr(model, "model") and hasattr(model.model, "get_params"):
+    with st.expander("Model Hyperparameters"):
+        params = model.model.get_params()
+        tuned = {k: params[k] for k in ["n_estimators", "max_depth", "learning_rate", "subsample", "colsample_bytree"] if k in params}
+        st.json(tuned if tuned else params)
 
 st.markdown("---")
 
@@ -565,10 +635,12 @@ with tab1:
                             labels={"value": "Importance", "index": "Feature"},
                             color=fi.values,
                             color_continuous_scale=[[0, "#0099ff"], [1, "#00e6b4"]])
+            
+            dynamic_height = max(360, len(feature_cols) * 28)
             fi_fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
                                  plot_bgcolor="rgba(13,17,23,0.8)",
                                  showlegend=False, coloraxis_showscale=False,
-                                 height=360, margin=dict(l=0, r=0, t=40, b=0))
+                                 height=dynamic_height, margin=dict(l=0, r=0, t=40, b=0))
             st.plotly_chart(fi_fig, use_container_width=True)
 
     st.markdown("---")
@@ -591,7 +663,7 @@ with tab1:
 
         fut_fig = go.Figure()
 
-        # History context — mirrors the selected chart style
+        # History context
         if chart_type == "Candlestick":
             fut_fig.add_trace(go.Candlestick(
                 x=ohlc_hist.index, open=ohlc_hist["Open"], high=ohlc_hist["High"],
@@ -622,7 +694,6 @@ with tab1:
                 line=dict(color="rgba(255,255,255,0.5)", width=1.8),
             ))
 
-        # Bridge + CI + forecast line
         fut_fig.add_trace(go.Scatter(
             x=[last_actual_date, fut_dates[0]],
             y=[last_actual_price, future_df["Predicted_Close"].iloc[0]],
@@ -666,7 +737,6 @@ with tab1:
         )
         st.plotly_chart(fut_fig, use_container_width=True)
 
-        # Future price table
         st.markdown("##### 📅 Projected Prices — Next Trading Days")
         table_df = future_df.copy()
         table_df.index = table_df.index.strftime("%A, %b %d %Y")
@@ -700,10 +770,37 @@ with tab2:
             "MAPE":  f"{res['mape']:.4f} %",
         })
     st.table(pd.DataFrame(leaderboard_data))
+    
+    st.markdown("---")
+    st.markdown("#### 🧠 AI Council Ensemble (1-Day Target)")
+    if council_preds and meta_model:
+        council_data = []
+        engine_details = {
+            'xgboost': "TreeExpert (XGBoost)",
+            'prophet': "TimeExpert (Prophet)",
+        }
+        
+        final_weights = meta_model._redistribute_weights(weights_used, [k for k, v in council_preds.items() if v is not None])
+        
+        for engine_key, engine_name in engine_details.items():
+            base_w = weights_used.get(engine_key, 0)
+            final_w = final_weights.get(engine_key, 0)
+            pred_val = council_preds.get(engine_key)
+            
+            council_data.append({
+                "Model": engine_name,
+                "Target Price": f"{curr_sym}{pred_val:.2f}" if pred_val is not None else "⚠️ FAILED",
+                "Volatility Engine Weight": f"{final_w * 100:.1f}%",
+            })
+            
+        st.table(pd.DataFrame(council_data))
+        st.caption(f"Currently acting under **{market_regime}** parameters. Weights dynamically adjusted.")
+    else:
+        st.info("AI Council Ensemble calculations not available.")
 
     st.markdown("---")
     st.markdown("#### 📰 NLP News Sentiment")
-    st.info(f"**Current Sentiment:** {s_label} (Score: {latest_sentiment:.2f})")
+    # st.info(f"**Current Sentiment:** {s_label} (Score: {latest_sentiment:.2f})")
     with st.expander("🔍 View Latest Headlines"):
         if not latest_headlines:
             st.warning("No recent news found on Yahoo Finance for this ticker.")
@@ -718,5 +815,4 @@ with tab3:
     st.dataframe(df.tail(100), use_container_width=True)
 
 st.markdown("---")
-st.caption("OmniQuant v0.7 · Built with Streamlit & Plotly · Data via Yahoo Finance")
-
+st.caption("OmniQuant v0.8.1 · Ensembles + AutoML")
