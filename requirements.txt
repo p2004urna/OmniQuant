@@ -1,17 +1,7 @@
+setuptools==81.0.0
+numpy<2.0.0
+pandas<2.2.0
+pandas-ta==0.3.14b
 beautifulsoup4
 nltk
-numpy<2.0.0
-optuna
-pandas<3.0.0
-pandas_ta
-plotly
-prophet
-pytz
-scikit-learn
-statsmodels
-streamlit
-tensorflow
-xgboost
-yfinance>=0.2.37
-vaderSentiment==3.3.2
-streamlit==1.32.0  # Or another version you know worked
+streamlit==1.32.0
