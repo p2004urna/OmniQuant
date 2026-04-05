@@ -19,6 +19,7 @@ import gc
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import pandas_ta as ta
 
@@ -29,27 +30,52 @@ from model_trainer import MetaForecaster
 
 # ── Future Forecasting Helper ─────────────────────────────────────────────────
 
-def _recompute_features(close_s: pd.Series, feature_cols: list) -> pd.DataFrame:
-    """Recalculate all TA features from a Close price series."""
+def _recompute_features(
+    close_s: pd.Series,
+    feature_cols: list,
+    last_known: dict | None = None,
+) -> pd.DataFrame:
+    """Recalculate all TA features from a Close price series.
+
+    Args:
+        close_s:      Full simulated close-price history.
+        feature_cols: The exact columns the model was trained on.
+        last_known:   Dict of {col: value} from the last historical row —
+                      used as a fallback when the series is too short for
+                      an indicator to produce a value (e.g. SMA_200 needs
+                      200 rows).
+    """
+    if last_known is None:
+        last_known = {}
+
     tmp = pd.DataFrame({"Close": close_s})
-    
-    tmp["Open"] = tmp["Close"]
-    tmp["High"] = tmp["Close"]
-    tmp["Low"] = tmp["Close"]
-    tmp["Volume"] = 1000000 
-    
+
+    tmp["Open"]   = tmp["Close"]
+    tmp["High"]   = tmp["Close"]
+    tmp["Low"]    = tmp["Close"]
+    tmp["Volume"] = 1_000_000
+
+    # Core TA indicators (existing)
     tmp.ta.bbands(length=20, std=2, append=True)
     tmp.ta.atr(length=14, append=True)
     tmp.ta.rsi(length=14, append=True)
     tmp.ta.macd(fast=12, slow=26, signal=9, append=True)
     tmp.ta.obv(append=True)
-    
+
+    # Explicit SMA / RSI columns matching the training schema
+    tmp["SMA_50"]  = ta.sma(close=tmp["Close"], length=50)
+    tmp["SMA_200"] = ta.sma(close=tmp["Close"], length=200)
+    tmp["RSI_14"]  = ta.rsi(close=tmp["Close"], length=14)
+
     tmp["Log_Returns"] = np.log(tmp["Close"] / tmp["Close"].shift(1))
-    
+
+    # Fill any column the model expects but is missing or NaN
     for col in feature_cols:
         if col not in tmp.columns:
-            tmp[col] = 0.0
-            
+            tmp[col] = last_known.get(col, 0.0)
+        elif tmp[col].isna().any() and col in last_known:
+            tmp[col] = tmp[col].fillna(last_known[col])
+
     return tmp[feature_cols]
 
 
@@ -67,51 +93,55 @@ def generate_future_forecast(
     from model_zoo import TimeExpert
     from model_trainer import MetaForecaster
 
-    X_full = X_train[feature_cols]
-    y_full = y_train
-
-    # Wait, the model is already trained from evaluator.py's backtest.
-    # But just to be sure we can train it again or it's implicitly trained.
-    # Let's use the passed model as is, it's already trained on 100%.
+    # ── Snapshot of the last known indicator values (trend context) ────────
+    last_known = {}
+    for col in feature_cols:
+        if col in X_train.columns:
+            last_known[col] = float(X_train[col].iloc[-1])
 
     last_date = X_train.index[-1] + BDay(1)
     if not X_inference.empty and X_inference.index[0] > X_train.index[-1]:
         last_date = X_inference.index[0]
-        
+
     future_dates = pd.bdate_range(start=last_date, periods=n_days)
 
     xgb_future_preds = []
-    
-    # Day 1 prediction from X_inference
-    curr_inf_row = X_inference[feature_cols].copy()
+
+    # ── Day 1: predict from X_inference, injecting missing indicator cols ─
+    curr_inf_row = X_inference.copy()
+    for col in feature_cols:
+        if col not in curr_inf_row.columns:
+            curr_inf_row[col] = last_known.get(col, 0.0)
+    curr_inf_row = curr_inf_row[feature_cols]
+
     xgb_pred_day1 = float(model.predict(curr_inf_row)[0])
     xgb_future_preds.append(round(xgb_pred_day1, 4))
-    
-    # Simulated Future History for days 2 to n_days
+
+    # ── Days 2‥N: iterative forecast using recomputed features ────────────
     close_history = X_train[target_col].tolist()
     close_history.append(xgb_pred_day1)
-    
+
     for _ in range(1, n_days):
         close_series = pd.Series(close_history, dtype=float)
-        feature_df = _recompute_features(close_series, feature_cols)
-        last_row = feature_df.dropna().iloc[[-1]] 
+        feature_df = _recompute_features(close_series, feature_cols, last_known)
+        last_row = feature_df.dropna().iloc[[-1]]
         pred_close = float(model.predict(last_row)[0])
         xgb_future_preds.append(round(pred_close, 4))
         close_history.append(pred_close)
 
-    # Prophet predictions
+    # ── Prophet predictions ───────────────────────────────────────────────
     time_model = TimeExpert()
     prophet_preds = time_model.forecast(X_train, horizon=n_days)
 
-    # Ensemble!
+    # ── Ensemble ──────────────────────────────────────────────────────────
     meta = MetaForecaster()
     weights_used = meta._get_volatility_weights(X_train)
-    
+
     valid_keys = ['xgboost', 'prophet']
     final_weights = meta._redistribute_weights(weights_used, valid_keys)
     w_xgb = final_weights['xgboost']
     w_pro = final_weights['prophet']
-    
+
     ensemble_preds = []
     for i in range(n_days):
         ensemble_price = xgb_future_preds[i] * w_xgb + prophet_preds[i] * w_pro
@@ -272,6 +302,15 @@ if run_btn:
                 ticker, lookback, display_currency
             )
             df = X_train # Chronological data for charting
+            
+            df['SMA_50'] = ta.sma(close=df['Close'], length=50)
+            df['SMA_200'] = ta.sma(close=df['Close'], length=200)
+            df['RSI_14'] = ta.rsi(close=df['Close'], length=14)
+            df.dropna(inplace=True)
+            y_train = y_train.loc[df.index]
+            
+            print(df[['Close', 'SMA_50', 'SMA_200', 'RSI_14']].tail())
+            
             current_sentiment = float(X_inference.get('Sentiment_Score', pd.Series([0.0])).iloc[-1])
         except Exception as exc:
             st.error(f"❌ Data fetch failed for **{ticker}**: {exc}")
@@ -296,11 +335,16 @@ if run_btn:
     
     ta_patterns = ("RSI_", "BBL_", "BBM_", "BBU_", "BBB_", "BBP_", "MACD", "ATR", "OBV", "SMA_")
     feature_cols = [
-        c for c in X_train.columns 
+        c for c in df.columns 
         if c != TARGET_COL and c != "Target_Next_Close" and (c.startswith(ta_patterns) or c in ["Log_Returns", "Sentiment_Score", "Volume"])
     ]
     
-    X = X_train[feature_cols]
+    # Guarantee our TA indicators are always visible to the AI
+    for indicator in ["SMA_50", "SMA_200", "RSI_14"]:
+        if indicator in df.columns and indicator not in feature_cols:
+            feature_cols.append(indicator)
+    
+    X = df[feature_cols]
     y = y_train
 
     # 3. AutoML Race
@@ -356,7 +400,13 @@ if run_btn:
         try:
             tree_model = TreeForecaster()
             tree_model.train(X, y)
-            council_preds['xgboost'] = float(tree_model.predict(X_inference[feature_cols])[0])
+            # Seed X_inference with indicator columns the model expects
+            tree_inf = X_inference.copy()
+            for col in feature_cols:
+                if col not in tree_inf.columns:
+                    tree_inf[col] = float(df[col].iloc[-1]) if col in df.columns else 0.0
+            tree_inf = tree_inf[feature_cols]  # exact column order
+            council_preds['xgboost'] = float(tree_model.predict(tree_inf)[0])
         except Exception as e:
             st.warning(f"TreeExpert Failed: {e}")
             council_preds['xgboost'] = None
@@ -495,39 +545,40 @@ tab1, tab2, tab3 = st.tabs(["🔮 Forecast", "🏎️ Leaderboard", "📊 Raw Da
 with tab1:
     st.markdown(f"#### 📉 30-Day Backtest · {winner_name}")
 
-    col_chart, col_overlay = st.columns([1, 2])
+    col_chart, _ = st.columns([1, 2])
     with col_chart:
         chart_type = st.selectbox(
             "Chart Style",
-            ["Candlestick", "Line", "OHLC", "Area"],
+            ["Candlestick", "Line"],
             index=0,
-        )
-    with col_overlay:
-        overlays = st.multiselect(
-            "Chart Overlays",
-            ["SMA 20", "SMA 50"],
-            default=[],
-            help="Overlay Simple Moving Averages on the backtest chart.",
         )
 
     traj      = winner_res["trajectory"]
     bt_dates  = traj.index
     actuals   = traj["Actual"].values
     preds     = traj["Predicted"].values
-    residuals = preds - actuals
-    sigma = np.std(residuals)
-    upper = preds + 1.96 * sigma
-    lower = preds - 1.96 * sigma
+    upper = preds * 1.05
+    lower = preds * 0.95
 
     ohlc_bt = df[["Open", "High", "Low", "Close"]].loc[df.index.isin(bt_dates)]
 
-    # ── Charting SMAs (pandas rolling — no ta-lib name collision) ─────────────
-    sma20 = df["Close"].rolling(window=20).mean()
-    sma50 = df["Close"].rolling(window=50).mean()
+    # ── SMA & RSI series aligned to backtest window ───────────────────────────
+    sma50_bt  = df["SMA_50"].loc[df.index.isin(bt_dates)]
+    sma200_bt = df["SMA_200"].loc[df.index.isin(bt_dates)]
+    rsi_bt    = df["RSI_14"].loc[df.index.isin(bt_dates)]
 
-    fig = go.Figure()
+    # ── Double-Decker Subplot Layout ──────────────────────────────────────────
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        row_heights=[0.7, 0.3],
+        subplot_titles=(f"{ticker_ran} Price", "RSI (14)"),
+    )
 
-    # ── Dynamic historical trace ──────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # ROW 1 — Price Chart + SMA Overlays + CI Band + AI Prediction
+    # ══════════════════════════════════════════════════════════════════════════
     if chart_type == "Candlestick":
         fig.add_trace(go.Candlestick(
             x=ohlc_bt.index, open=ohlc_bt["Open"], high=ohlc_bt["High"],
@@ -536,86 +587,128 @@ with tab1:
             increasing=dict(line=dict(color="#00e6b4"), fillcolor="rgba(0,230,180,0.5)"),
             decreasing=dict(line=dict(color="#ff4c6a"), fillcolor="rgba(255,76,106,0.5)"),
             hoverinfo="x+y",
-        ))
-    elif chart_type == "OHLC":
-        fig.add_trace(go.Ohlc(
-            x=ohlc_bt.index, open=ohlc_bt["Open"], high=ohlc_bt["High"],
-            low=ohlc_bt["Low"], close=ohlc_bt["Close"],
-            name="OHLC (Actual)",
-            increasing=dict(line=dict(color="#00e6b4")),
-            decreasing=dict(line=dict(color="#ff4c6a")),
-        ))
-    elif chart_type == "Area":
-        fig.add_trace(go.Scatter(
-            x=bt_dates, y=actuals, mode="lines",
-            name="Historical Close",
-            line=dict(color="#0099ff", width=2),
-            fill="tozeroy", fillcolor="rgba(0,153,255,0.10)",
-            hovertemplate=f"<b>Close</b>: {curr_sym}%{{y:.2f}}<br>%{{x|%b %d %Y}}<extra></extra>",
-        ))
+        ), row=1, col=1)
     else:  # Line
         fig.add_trace(go.Scatter(
             x=bt_dates, y=actuals, mode="lines",
             name="Historical Close",
             line=dict(color="#ffffff", width=2),
             hovertemplate=f"<b>Close</b>: {curr_sym}%{{y:.2f}}<br>%{{x|%b %d %Y}}<extra></extra>",
-        ))
+        ), row=1, col=1)
 
-    # ── SMA Overlays (user-selected) ──────────────────────────────────────────
-    sma20_bt = sma20.loc[sma20.index.isin(bt_dates)]
-    sma50_bt = sma50.loc[sma50.index.isin(bt_dates)]
+    # SMA 50 (Gold)
+    fig.add_trace(go.Scatter(
+        x=sma50_bt.index, y=sma50_bt.values,
+        mode="lines", name="SMA 50",
+        line=dict(color="gold", width=1.5),
+        hovertemplate=f"<b>SMA 50</b>: {curr_sym}%{{y:.2f}}<extra></extra>",
+    ), row=1, col=1)
 
-    if "SMA 20" in overlays:
-        fig.add_trace(go.Scatter(
-            x=sma20_bt.index, y=sma20_bt.values,
-            mode="lines", name="SMA 20",
-            line=dict(color="orange", width=2),
-            hovertemplate=f"<b>SMA 20</b>: {curr_sym}%{{y:.2f}}<br>%{{x|%b %d %Y}}<extra></extra>",
-        ))
-    if "SMA 50" in overlays:
-        fig.add_trace(go.Scatter(
-            x=sma50_bt.index, y=sma50_bt.values,
-            mode="lines", name="SMA 50",
-            line=dict(color="#6fa8ff", width=2),
-            hovertemplate=f"<b>SMA 50</b>: {curr_sym}%{{y:.2f}}<br>%{{x|%b %d %Y}}<extra></extra>",
-        ))
+    # SMA 200 (Royal Blue)
+    fig.add_trace(go.Scatter(
+        x=sma200_bt.index, y=sma200_bt.values,
+        mode="lines", name="SMA 200",
+        line=dict(color="royalblue", width=1.5),
+        hovertemplate=f"<b>SMA 200</b>: {curr_sym}%{{y:.2f}}<extra></extra>",
+    ), row=1, col=1)
 
-    # ── CI band + AI prediction (always present) ──────────────────────────────
+    # 95% Confidence Band
     fig.add_trace(go.Scatter(
         x=np.concatenate([bt_dates, bt_dates[::-1]]),
         y=np.concatenate([upper, lower[::-1]]),
         fill="toself", fillcolor="rgba(0,153,255,0.08)",
         line=dict(color="rgba(0,0,0,0)"),
         name="95% Confidence Band", hoverinfo="skip",
-    ))
+    ), row=1, col=1)
     fig.add_trace(go.Scatter(x=bt_dates, y=upper, mode="lines",
         line=dict(color="rgba(0,153,255,0.40)", width=1, dash="dot"),
-        name="Upper CI", hovertemplate=f"Upper CI: {curr_sym}%{{y:.2f}}<extra></extra>"))
+        name="Upper CI", hovertemplate=f"Upper CI: {curr_sym}%{{y:.2f}}<extra></extra>",
+    ), row=1, col=1)
     fig.add_trace(go.Scatter(x=bt_dates, y=lower, mode="lines",
         line=dict(color="rgba(0,153,255,0.40)", width=1, dash="dot"),
-        name="Lower CI", hovertemplate=f"Lower CI: {curr_sym}%{{y:.2f}}<extra></extra>"))
+        name="Lower CI", hovertemplate=f"Lower CI: {curr_sym}%{{y:.2f}}<extra></extra>",
+    ), row=1, col=1)
+
+    # AI Prediction
     fig.add_trace(go.Scatter(
         x=bt_dates, y=preds, mode="lines+markers", name="AI Prediction",
         line=dict(color="#00e6b4", width=2.5, dash="dash"),
         marker=dict(size=5, color="#00e6b4", symbol="diamond"),
         hovertemplate=f"<b>Predicted</b>: {curr_sym}%{{y:.2f}}<br>%{{x|%b %d %Y}}<extra></extra>",
-    ))
+    ), row=1, col=1)
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # ROW 2 — RSI Panel
+    # ══════════════════════════════════════════════════════════════════════════
+    fig.add_trace(go.Scatter(
+        x=rsi_bt.index, y=rsi_bt.values,
+        mode="lines", name="RSI 14",
+        line=dict(color="#9b59b6", width=2),
+        hovertemplate="<b>RSI</b>: %{y:.1f}<extra></extra>",
+    ), row=2, col=1)
+
+    # Overbought / Oversold threshold lines
+    fig.add_hline(y=70, line_dash="dash", line_color="gray", opacity=0.5,
+                  annotation_text="Overbought (70)",
+                  annotation_position="top right",
+                  annotation_font_color="gray",
+                  row=2, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color="gray", opacity=0.5,
+                  annotation_text="Oversold (30)",
+                  annotation_position="bottom right",
+                  annotation_font_color="gray",
+                  row=2, col=1)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Global Layout
+    # ══════════════════════════════════════════════════════════════════════════
     fig.update_layout(
         template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(13,17,23,0.8)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(13,17,23,0.8)",
         font=dict(family="Inter, sans-serif", color="#c9d1d9"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
-                    bgcolor="rgba(0,0,0,0.4)", bordercolor="rgba(255,255,255,0.1)", borderwidth=1),
-        xaxis=dict(title="Date", gridcolor="rgba(255,255,255,0.06)",
-                   showline=True, linecolor="rgba(255,255,255,0.15)",
-                   rangeslider=dict(visible=True, bgcolor="rgba(13,17,23,0.8)", thickness=0.05)),
-        yaxis=dict(title=f"{ticker_ran} Price ({currency_code})",
-                   gridcolor="rgba(255,255,255,0.06)",
-                   showline=True, linecolor="rgba(255,255,255,0.15)",
-                   tickprefix=curr_sym),
-        hovermode="x unified", margin=dict(l=0, r=0, t=40, b=0), height=520,
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5,
+            bgcolor="rgba(0,0,0,0.4)",
+            bordercolor="rgba(255,255,255,0.1)", borderwidth=1,
+        ),
+        hovermode="x unified",
+        margin=dict(l=0, r=0, t=60, b=0),
+        height=680,
     )
+
+    # Row 1 axes
+    fig.update_yaxes(
+        title_text="Price ($)",
+        gridcolor="rgba(255,255,255,0.06)",
+        showline=True, linecolor="rgba(255,255,255,0.15)",
+        tickprefix=curr_sym,
+        row=1, col=1,
+    )
+
+    # Row 2 axes — RSI locked 0-100
+    fig.update_yaxes(
+        title_text="RSI",
+        range=[0, 100],
+        gridcolor="rgba(255,255,255,0.06)",
+        showline=True, linecolor="rgba(255,255,255,0.15)",
+        row=2, col=1,
+    )
+
+    # Shared x-axis label only on the bottom row; remove rangeslider
+    fig.update_xaxes(
+        gridcolor="rgba(255,255,255,0.06)",
+        showline=True, linecolor="rgba(255,255,255,0.15)",
+        row=1, col=1,
+        rangeslider_visible=False,
+    )
+    fig.update_xaxes(
+        title_text="Date",
+        gridcolor="rgba(255,255,255,0.06)",
+        showline=True, linecolor="rgba(255,255,255,0.15)",
+        row=2, col=1,
+    )
+
     st.plotly_chart(fig, use_container_width=True)
 
     # Backtest table
@@ -657,9 +750,8 @@ with tab1:
         last_actual_price = float(df[TARGET_COL].iloc[-1])
         ohlc_hist = df[["Open", "High", "Low", "Close"]].iloc[-30:]
         fut_dates  = future_df.index
-        fut_sigma  = np.std(winner_res["trajectory"]["Error"].values)
-        fut_upper  = future_df["Predicted_Close"].values + 1.96 * fut_sigma
-        fut_lower  = future_df["Predicted_Close"].values - 1.96 * fut_sigma
+        fut_upper  = future_df["Predicted_Close"].values * 1.05
+        fut_lower  = future_df["Predicted_Close"].values * 0.95
 
         fut_fig = go.Figure()
 

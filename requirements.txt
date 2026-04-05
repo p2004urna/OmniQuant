@@ -1,7 +1,9 @@
-setuptools==81.0.0
-numpy<2.0.0
-pandas<2.2.0
-pandas-ta==0.3.14b
-beautifulsoup4
-nltk
-streamlit==1.32.0
+numpy==2.2.6
+numba==0.61.2
+pandas==2.2.3
+pandas-ta==0.4.71b0
+streamlit
+yfinance
+xgboost
+plotly
+scikit-learn
